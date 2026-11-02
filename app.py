@@ -8,9 +8,11 @@ st.set_page_config(page_title="Voice Clone", page_icon="🎙️")
 st.title("🎙️ Voice Clone")
 st.caption("Give a short reference voice + some text. Get the text spoken in that voice.")
 
-# Free backend: a public XTTS-v2 Space on Hugging Face (change if it goes down)
-SPACE_ID = st.sidebar.text_input("Hugging Face Space", "coqui/xtts")
-HF_TOKEN = st.secrets.get("HF_TOKEN", None) if hasattr(st, "secrets") else None
+HF_TOKEN = None
+try:
+    HF_TOKEN = st.secrets.get("HF_TOKEN")
+except Exception:
+    pass
 
 LANGS = {
     "English": "en", "Hindi": "hi", "Spanish": "es", "French": "fr",
@@ -19,7 +21,36 @@ LANGS = {
     "Arabic": "ar", "Chinese": "zh-cn", "Japanese": "ja", "Korean": "ko",
     "Hungarian": "hu",
 }
-lang_name = st.selectbox("Language of the text", list(LANGS), index=0)
+
+
+def find_audio(result):
+    items = result if isinstance(result, (list, tuple)) else [result]
+    for x in items:
+        if isinstance(x, dict):
+            x = x.get("path") or x.get("value")
+        if isinstance(x, str) and x.lower().endswith((".wav", ".mp3", ".flac")):
+            return x
+    return None
+
+
+# Each backend: (space id, supports language choice, call function)
+def call_tonyassi(client, text, lang, ref_path):
+    # English-only space: clone(text, audio)
+    return client.predict(text, handle_file(ref_path), api_name="/clone")
+
+
+def call_coqui(client, text, lang, ref_path):
+    return client.predict(text, lang, handle_file(ref_path), None, False, False, False, True,
+                          api_name="/predict")
+
+
+BACKENDS = [
+    ("tonyassi/voice-clone", False, call_tonyassi),
+    ("coqui/xtts", True, call_coqui),
+]
+
+lang_name = st.selectbox("Language of the text", list(LANGS), index=0,
+                         help="Only English works on the main backend; other languages need the fallback (coqui/xtts) to be online.")
 
 st.subheader("1. Reference voice")
 st.write("Use 6–30 seconds of clean speech, no background noise or music.")
@@ -42,47 +73,45 @@ consent = st.checkbox(
 )
 
 if st.button("Generate", type="primary", disabled=not (ref and text.strip() and consent)):
-    with st.spinner("Cloning voice... the first request can take a minute while the Space wakes up."):
-        tmp_path = None
-        try:
-            suffix = os.path.splitext(getattr(ref, "name", "ref.wav"))[1] or ".wav"
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
-                f.write(ref.getvalue())
-                tmp_path = f.name
+    tmp_path = None
+    audio_bytes = None
+    errors = []
+    try:
+        suffix = os.path.splitext(getattr(ref, "name", "ref.wav"))[1] or ".wav"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
+            f.write(ref.getvalue())
+            tmp_path = f.name
 
-            client = Client(SPACE_ID, hf_token=HF_TOKEN) if HF_TOKEN else Client(SPACE_ID)
-            result = client.predict(
-                text.strip(),                 # prompt
-                LANGS[lang_name],             # language
-                handle_file(tmp_path),        # reference audio
-                None,                         # mic file (unused)
-                False,                        # use_mic
-                False,                        # cleanup_reference
-                False,                        # auto_detect_language
-                True,                         # agree to terms
-                api_name="/predict",
-            )
+        for space_id, multilingual, fn in BACKENDS:
+            if lang_name != "English" and not multilingual:
+                errors.append(f"{space_id}: skipped (English only)")
+                continue
+            with st.spinner(f"Cloning voice via {space_id}... first request can take a minute."):
+                try:
+                    client = Client(space_id, token=HF_TOKEN) if HF_TOKEN else Client(space_id)
+                    result = fn(client, text.strip(), LANGS[lang_name], tmp_path)
+                    path = find_audio(result)
+                    if not path:
+                        raise RuntimeError(f"unexpected response: {result}")
+                    with open(path, "rb") as a:
+                        audio_bytes = a.read()
+                    st.caption(f"Generated with {space_id}")
+                    break
+                except Exception as e:
+                    errors.append(f"{space_id}: {e}")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
-            # Result is a tuple/list; find the generated audio file path
-            items = result if isinstance(result, (list, tuple)) else [result]
-            audio_path = next(
-                (x for x in items if isinstance(x, str) and x.lower().endswith((".wav", ".mp3", ".flac"))),
-                None,
-            )
-            if not audio_path:
-                st.error(f"Unexpected response from the Space: {result}")
-            else:
-                with open(audio_path, "rb") as a:
-                    audio_bytes = a.read()
-                st.success("Done!")
-                st.audio(audio_bytes)
-                st.download_button("Download", audio_bytes, "cloned_voice.wav", "audio/wav")
-        except Exception as e:
-            st.error(f"Generation failed: {e}")
-            st.info("The free Space may be busy, asleep or changed. Try again, or switch the Space ID in the sidebar.")
-        finally:
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
+    if audio_bytes:
+        st.success("Done!")
+        st.audio(audio_bytes)
+        st.download_button("Download", audio_bytes, "cloned_voice.wav", "audio/wav")
+    else:
+        st.error("All backends failed.")
+        for e in errors:
+            st.write(f"- {e}")
+        st.info("Free Spaces can be busy, asleep or broken. Add a free HF_TOKEN in Streamlit secrets (higher quota), wait a minute and retry.")
 
 st.divider()
 st.caption("Only clone voices you own or have permission to use. Do not use for impersonation or fraud.")
