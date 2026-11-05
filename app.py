@@ -65,7 +65,7 @@ if ref:
     st.audio(ref)
 
 st.subheader("2. Text to speak")
-text = st.text_area("Text", height=150, max_chars=500,
+text = st.text_area("Text", height=150, max_chars=2000,
                     placeholder="Type what the cloned voice should say...")
 
 consent = st.checkbox(
